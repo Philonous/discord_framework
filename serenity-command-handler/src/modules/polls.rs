@@ -76,6 +76,7 @@ async fn create_poll(
     handler: &Handler,
     ctx: &Context,
     interaction: &CommandInteraction,
+    on_start: Option<&PollReadyHandler>,
 ) -> anyhow::Result<()> {
     let module: &ModPoll = handler.module()?;
     let http = &ctx.http;
@@ -139,6 +140,8 @@ async fn create_poll(
         // resp,
         pending_poll,
         receiver,
+        (&interaction.channel_id).to_owned(),
+        on_start.map(|h| h.clone()),
     ));
     Ok(())
 }
@@ -149,12 +152,13 @@ impl ReadyPoll {
         handler: &Handler,
         ctx: &Context,
         interaction: &CommandInteraction,
+        on_start: &PollReadyHandler,
     ) -> anyhow::Result<()> {
         let poll_type = PollType::Ready {
             count_emote: self.count_emote,
             go_emote: self.go_emote,
         };
-        create_poll(poll_type, handler, ctx, interaction).await
+        create_poll(poll_type, handler, ctx, interaction, Some(on_start)).await
     }
 }
 
@@ -173,7 +177,14 @@ impl Poll {
         interaction: &CommandInteraction,
     ) -> anyhow::Result<()> {
         let poll_type = PollType::Question(self.question);
-        create_poll(poll_type, handler, ctx, interaction).await
+        create_poll(
+            poll_type,
+            handler,
+            ctx,
+            interaction,
+            None::<&PollReadyHandler>,
+        )
+        .await
     }
 }
 
@@ -187,8 +198,12 @@ impl BotCommand for ReadyPoll {
         ctx: &Context,
         interaction: &CommandInteraction,
     ) -> anyhow::Result<CommandResponse> {
+        let modpoll = handler.modules.module::<ModPoll>().unwrap();
         // create ready poll message
-        let resp = match self.create_poll(handler, ctx, interaction).await {
+        let resp = match self
+            .create_poll(handler, ctx, interaction, &modpoll.on_go)
+            .await
+        {
             Err(e) => {
                 dbg!(&e);
                 Some(e.to_string())
@@ -202,7 +217,9 @@ impl BotCommand for ReadyPoll {
                     &ctx.http,
                     EditInteractionResponse::new()
                         .content(resp)
-                        .allowed_mentions(CreateAllowedMentions::new().empty_users()),
+                        .allowed_mentions(
+                            CreateAllowedMentions::new().empty_users(),
+                        ),
                 )
                 .await?;
         }
@@ -287,6 +304,8 @@ async fn poll_task(
     http: Arc<Http>,
     poll: PendingPoll,
     mut r: Receiver<PollEvent>,
+    channel_id: ChannelId,
+    on_start: Option<PollReadyHandler>,
 ) {
     // poll state
     let mut users_yes = Vec::new(); // list of users who have clicked the YES react
@@ -342,6 +361,12 @@ async fn poll_task(
                         go_emote.as_deref(),
                     )
                     .await;
+                    match &on_start {
+                        None => (),
+                        Some(go) => {
+                            go.ready(&channel_id).await;
+                        }
+                    }
                     if let Err(e) = res {
                         eprintln!("error executing crabdown: {e}");
                     }
@@ -409,6 +434,27 @@ pub async fn crabdown(
 
 type PollSenders = VecDeque<(MessageId, PollHandle)>;
 
+type PollReadyHandler = Arc<dyn ModPollReadyHandler + Send + Sync>;
+
+#[async_trait]
+pub trait ModPollReadyHandler {
+    async fn ready(&self, channel_id: &ChannelId) -> ();
+}
+
+#[async_trait]
+impl ModPollReadyHandler for () {
+    async fn ready(&self, _: &ChannelId) {
+        ()
+    }
+}
+
+#[async_trait]
+impl ModPollReadyHandler for Arc<dyn ModPollReadyHandler + Send + Sync> {
+    async fn ready(&self, channelid: &ChannelId) {
+        (**self).ready(channelid).await
+    }
+}
+
 pub struct ModPoll {
     pub yes: String,
     pub no: String,
@@ -416,6 +462,7 @@ pub struct ModPoll {
     pub count: String,
     pub go: String,
     ready_polls: Arc<RwLock<PollSenders>>,
+    on_go: PollReadyHandler,
 }
 
 impl ModPoll {
@@ -434,6 +481,7 @@ impl ModPoll {
         start: S3,
         count: S4,
         go: S5,
+        on_go: impl ModPollReadyHandler + Send + Sync + 'static,
     ) -> Self {
         ModPoll {
             yes: yes.into().unwrap_or(YES).to_string(),
@@ -442,6 +490,7 @@ impl ModPoll {
             count: count.into().unwrap_or(COUNT).to_string(),
             go: go.into().unwrap_or(GO).to_string(),
             ready_polls: Default::default(),
+            on_go: Arc::new(on_go),
         }
     }
 
@@ -519,7 +568,7 @@ impl ModPoll {
 
 impl Default for ModPoll {
     fn default() -> Self {
-        Self::new(None, None, None, None, None)
+        Self::new(None, None, None, None, None, ())
     }
 }
 
